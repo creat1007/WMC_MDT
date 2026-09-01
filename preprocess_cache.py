@@ -13,8 +13,8 @@
 
 用法：
     python preprocess_cache.py \
-        --data_path /workspace/tmp/tanch/data/radar/training_data_Pek/ \
-        --cache_dir /workspace/tmp/tanch/data/radar/cache_512/ \
+        --data_path /path/to/radar_data/region_A/ \
+        --cache_dir /path/to/radar_data/cache_512/ \
         --img_height 512 --img_width 512 --workers 8
 
 注意：缓存按 float16 存，约 (T×512×512×2) 字节/文件。先确认磁盘空间足够

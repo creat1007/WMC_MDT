@@ -33,8 +33,8 @@ from nowcasting.layers.generation.discriminator import (
 )
 
 # 华北+华南混合训练：逗号分隔多个目录（不写 --train_data_path 时默认用这个）
-TRAIN_DATA_PATH = '/workspace/tmp/tanch/data/radar/training_data_Pek,/workspace/tmp/tanch/data/radar/training_data_GBA'
-CACHE_DIR = '/workspace/tmp/tanch/data/radar/cache_512/'
+TRAIN_DATA_PATH = '/path/to/radar_data/region_A,/path/to/radar_data/region_B'
+CACHE_DIR = '/path/to/radar_data/cache_512/'
 SAVE_DIR = './checkpoints'
 LOG_FILE = './checkpoints/training_log.csv'
 
