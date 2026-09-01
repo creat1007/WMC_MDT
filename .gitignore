@@ -1,0 +1,31 @@
+# 训练数据 / 权重 / 输出（体积大，不入库）
+training_data/
+data/
+*.nc
+*.npy
+*.ckpt
+*.pth
+checkpoints*/
+results/
+output*/
+diag_*/
+cache/
+test/
+
+# 日志
+*.log
+*.csv
+nohup.out
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# 系统 / 编辑器
+.DS_Store
+._*
+.claude/
+.vscode/
+.idea/

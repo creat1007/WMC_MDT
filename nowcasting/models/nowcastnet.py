@@ -1,0 +1,72 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from nowcasting.layers.utils import warp, make_grid
+from nowcasting.layers.generation.generative_network import Generative_Encoder, Generative_Decoder
+from nowcasting.layers.evolution.evolution_network import Evolution_Network
+from nowcasting.layers.generation.noise_projector import Noise_Projector
+
+class Net(nn.Module):
+    def __init__(self, configs):
+        super(Net, self).__init__()
+        self.configs = configs
+        self.pred_length = self.configs.total_length - self.configs.input_length
+
+        self.evo_net = Evolution_Network(self.configs.input_length, self.pred_length, base_c=32)
+        self.gen_enc = Generative_Encoder(self.configs.total_length, base_c=self.configs.ngf)
+        self.gen_dec = Generative_Decoder(self.configs)
+        self.proj = Noise_Projector(self.configs.ngf, configs)
+
+        sample_tensor = torch.zeros(1, 1, self.configs.img_height, self.configs.img_width)
+        self.register_buffer('grid', make_grid(sample_tensor))
+
+    def forward(self, all_frames, return_evo=False):
+        all_frames = all_frames[:, :, :, :, :1]
+
+        frames = all_frames.permute(0, 1, 4, 2, 3)
+        batch = frames.shape[0]
+        height = frames.shape[3]
+        width = frames.shape[4]
+
+        # Input Frames
+        input_frames = frames[:, :self.configs.input_length]
+        input_frames = input_frames.reshape(batch, self.configs.input_length, height, width)
+
+        # Evolution Network
+        intensity, motion = self.evo_net(input_frames)
+        motion_ = motion.reshape(batch, self.pred_length, 2, height, width)
+        intensity_ = intensity.reshape(batch, self.pred_length, 1, height, width)
+        series = []
+        last_frames = all_frames[:, (self.configs.input_length - 1):self.configs.input_length, :, :, 0]
+        grid = self.grid.repeat(batch, 1, 1, 1)
+        # warp 插值模式（关键）：
+        #   原版 "nearest" 会把亚像素位移取整成 0 —— 而本模型预测的流场量级仅
+        #   ~0.02~0.2 像素/帧，于是 warp 实际什么都没做（等于原样复制上一帧），
+        #   台风只能靠 intensity 项反复叠加 → 结构被抹匀、1 小时糊掉；
+        #   更糟的是取整不可导，梯度传不回光流分支 → outc_v 权重坍缩(std 1e-4)
+        #   → 流场永远学不动。完整因果链：
+        #     nearest → 亚像素位移归零 → 光流对结果无影响 → 梯度≈0 → 权重坍缩
+        #   "bilinear" 支持亚像素位移且可导，是打破该死循环的前提。
+        warp_mode = getattr(self.configs, 'warp_mode', 'bilinear')
+        for i in range(self.pred_length):
+            last_frames = warp(last_frames, motion_[:, i], grid, mode=warp_mode, padding_mode="border")
+            last_frames = last_frames + intensity_[:, i]
+            series.append(last_frames)
+        evo_result = torch.cat(series, dim=1)
+        # 数据在loader已归一化到[0,1]，此处无需额外缩放
+
+        # Generative Network
+        evo_feature = self.gen_enc(torch.cat([input_frames, evo_result], dim=1))
+
+        noise = torch.randn(batch, self.configs.ngf, height // 32, width // 32, device=all_frames.device)
+        noise_feature = self.proj(noise).reshape(batch, -1, 4, 4, 8, 8).permute(0, 1, 4, 5, 2, 3).reshape(batch, -1, height // 8, width // 8)
+
+        feature = torch.cat([evo_feature, noise_feature], dim=1)
+        gen_result = self.gen_dec(feature, evo_result)
+
+        if return_evo:
+            # evo_result: (B, pred_length, H, W) 归一化空间的纯平流+强度演变结果
+            # motion_   : (B, pred_length, 2, H, W) 光流场，用于平滑正则
+            return gen_result.unsqueeze(-1), evo_result, motion_
+        return gen_result.unsqueeze(-1)
