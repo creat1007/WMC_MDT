@@ -32,7 +32,7 @@ from nowcasting.layers.generation.discriminator import (
     Temporal_Discriminator, hinge_loss_d, hinge_loss_g, pool_regularization,
 )
 
-# 华北+华南混合训练：逗号分隔多个目录（不写 --train_data_path 时默认用这个）
+# Mixed multi-region training: comma-separated directories (used when --train_data_path is omitted)
 TRAIN_DATA_PATH = '/path/to/radar_data/region_A,/path/to/radar_data/region_B'
 CACHE_DIR = '/path/to/radar_data/cache_512/'
 SAVE_DIR = './checkpoints'
@@ -40,10 +40,11 @@ LOG_FILE = './checkpoints/training_log.csv'
 
 class ParallelBatchLoader:
     """
-    線程版並行數據加載器，完全繞過 /dev/shm 限制。
-    多進程 DataLoader worker 需要通過共享內存傳輸 tensor（Docker 默認 64MB 不夠）。
-    改用線程後，所有線程共享主進程內存，無 shm 開銷。
-    xarray 讀取 NC 文件時釋放 GIL，多線程可真正並行 IO。
+    Thread-based parallel data loader that sidesteps the /dev/shm limit entirely.
+    Multiprocess DataLoader workers ship tensors through shared memory (Docker defaults to
+    64MB, which is not enough). With threads, all workers share the main process memory and
+    incur no shm overhead. xarray releases the GIL while reading NetCDF, so threads give
+    genuine I/O parallelism.
     """
     def __init__(self, dataset, sampler, batch_size, num_threads=8, prefetch=2):
         self.dataset = dataset
@@ -51,8 +52,9 @@ class ParallelBatchLoader:
         self.batch_size = batch_size
         self.num_threads = num_threads
         self.prefetch = prefetch
-        # 仅当使用 .npy 缓存（mmap，线程安全）时才并行读取 batch 内样本；
-        # 回退到原始 netCDF 路径时必须顺序读（HDF5/netCDF4 非线程安全，并发会 SIGSEGV）。
+        # Read samples in parallel only when the .npy cache is used (mmap, thread-safe).
+        # Falling back to raw netCDF requires sequential reads (HDF5/netCDF4 is not
+        # thread-safe and concurrent access segfaults).
         self.parallel = getattr(dataset, 'cache_dir', None) is not None and num_threads > 1
         self._pool = ThreadPoolExecutor(max_workers=num_threads) if self.parallel else None
 
@@ -65,7 +67,8 @@ class ParallelBatchLoader:
 
     def _load_batch(self, batch_indices):
         if self.parallel:
-            # 缓存模式：多线程并行读（mmap 读 + numpy 拷贝会释放 GIL），喂满 GPU
+            # Cached mode: read in parallel (mmap reads + numpy copies release the GIL),
+            # keeping the GPU fed
             samples = list(self._pool.map(self.dataset.__getitem__, batch_indices))
         else:
             samples = [self.dataset.__getitem__(idx) for idx in batch_indices]
@@ -99,7 +102,7 @@ class GracefulExiter:
         signal.signal(signal.SIGINT, self.exit_gracefully)
     
     def exit_gracefully(self, signum, frame):
-        print(f"\n[INFO] 收到信号 {signum}，正在保存模型并退出...", flush=True)
+        print(f"\n[INFO] Received signal {signum}; saving the model and exiting...", flush=True)
         self.should_exit = True
 
 class MemoryMonitor:
@@ -180,26 +183,28 @@ class SobelGradientLoss(nn.Module):
 
 def radar_weight(target_norm, data_max):
     """
-    DGMR / NowcastNet 风格的分级前景加权（基于真实 dBZ 阈值）。
-    雷达场 99%+ 像素是 0/弱回波，必须给强回波极高权重，
-    否则模型会塌缩到「输出空白」这个平凡解（loss 最小但毫无预报价值）。
+    Graded foreground weighting in the DGMR / NowcastNet style, based on true dBZ
+    thresholds. Over 99% of radar pixels are zero or weak echo, so strong echoes need a
+    much higher weight -- otherwise the model collapses to the trivial "blank output"
+    solution, which minimizes the loss but has no forecast value.
     """
     dbz = target_norm * data_max
     w = torch.ones_like(dbz)
     w = torch.where(dbz >= 10.0, torch.full_like(w, 2.0), w)
     w = torch.where(dbz >= 20.0, torch.full_like(w, 3.0), w)
     w = torch.where(dbz >= 30.0, torch.full_like(w, 5.0), w)
-    w = torch.where(dbz >= 40.0, torch.full_like(w, 10.0), w)  # 上限 30→10，缓解小batch梯度尖峰
+    w = torch.where(dbz >= 40.0, torch.full_like(w, 10.0), w)  # cap lowered 30 -> 10 to tame gradient spikes at small batch sizes
     return w
 
 def balanced_l1(pred, target, mask, data_max, fg_thresh_dbz=15.0, bg_weight=0.2):
-    """频率平衡 L1：前景 / 背景分别求均值再相加。
+    """Frequency-balanced L1: average foreground and background separately, then combine.
 
-    关键点：绝不对「全体像素」求加权平均——雷达场 99.99% 是零背景，
-    任何 sum/总数 形式的归一化都会把前景误差稀释到 ~1e-5，导致模型塌缩到
-    「输出空白」。这里前景单独按自身像素数求均值，每个强回波像素都拿到
-    强梯度；背景以小权重(bg_weight)参与，避免满屏噪声。前景内部再按
-    dBZ 分级加权(radar_weight)，强回波惩罚更重。"""
+    Key point: never take a weighted average over *all* pixels. Radar fields are ~99.99%
+    zero background, so any sum/total normalization dilutes foreground error down to ~1e-5
+    and the model collapses to blank output. Here the foreground is averaged over its own
+    pixel count, so every strong-echo pixel receives a strong gradient; the background
+    contributes with a small weight (bg_weight) to avoid full-screen noise. Within the
+    foreground, dBZ-graded weighting (radar_weight) penalizes strong echoes more."""
     diff = (pred - target).abs() * mask
     w = radar_weight(target, data_max)
     dbz = target * data_max
@@ -211,8 +216,9 @@ def balanced_l1(pred, target, mask, data_max, fg_thresh_dbz=15.0, bg_weight=0.2)
     return fg_loss + bg_weight * bg_loss
 
 def motion_smoothness(motion):
-    """光流场空间平滑正则：motion (B, T, 2, H, W)。
-    约束 evolution 网络学出连续、物理合理的平流场，而非杂乱位移。"""
+    """Spatial smoothness regularization for the flow field: motion (B, T, 2, H, W).
+    Encourages the evolution network to learn a continuous, physically plausible advection
+    field rather than scattered displacements."""
     b, t, c, h, w = motion.shape
     m = motion.reshape(b * t, c, h, w)
     dx = (m[:, :, :, 1:] - m[:, :, :, :-1]).abs().mean()
@@ -222,9 +228,10 @@ def motion_smoothness(motion):
 
 @torch.no_grad()
 def evaluate_csi(raw_model, val_dataset, device, args, max_samples=200):
-    """在留出验证集上计算 CSI（临界成功指数），这是临近预报的标准评分。
-    空白预报的 CSI=0，所以它能直接戳穿「loss 在降但模型没用」的假象。
-    返回 (各阈值CSI字典, 平均CSI)。仅在 rank 0 调用。"""
+    """Compute CSI (Critical Success Index) on the held-out validation set -- the standard
+    nowcasting score. A blank forecast scores CSI=0, so this immediately exposes the
+    "loss is falling but the model is useless" illusion.
+    Returns (dict of per-threshold CSI, mean CSI). Call on rank 0 only."""
     raw_model.eval()
     thresholds = [20.0, 30.0, 40.0]
     agg = {t: [0, 0, 0] for t in thresholds}  # [hits, misses, false_alarms]
@@ -257,11 +264,13 @@ def evaluate_csi(raw_model, val_dataset, device, args, max_samples=200):
 
 def train_one_epoch(model, loader, optimizer, scaler, device, args, grad_loss_fn, local_rank=0,
                     disc=None, optimizer_d=None, scaler_d=None, world_size=1, adv_active=True):
-    """训练一个 epoch。
-    - disc=None：纯 L1 训练（原行为，完全不变）。
-    - disc!=None：交替对抗训练（GAN）。判别器 disc 为「原始模块」(不套 DDP)，
-      多卡时手动 all-reduce 其梯度保持同步；生成器 model 仍是 DDP。
-    - adv_active=False：判别器热身阶段，D 照常训练，但暂不把对抗损失加到 G。
+    """Train one epoch.
+    - disc=None: plain L1 training (original behavior, unchanged).
+    - disc!=None: alternating adversarial (GAN) training. disc is a *raw* module (not wrapped
+      in DDP); under multi-GPU its gradients are all-reduced manually to stay in sync, while
+      the generator `model` remains DDP-wrapped.
+    - adv_active=False: discriminator warm-up -- D still trains, but the adversarial loss is
+      not yet added to G.
     """
     model.train()
     if disc is not None:
@@ -274,7 +283,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, args, grad_loss_fn
     for batch_idx, frames in enumerate(loader):
         if hasattr(train_one_epoch, 'exiter') and train_one_epoch.exiter.should_exit:
             if local_rank == 0:
-                print("[INFO] 收到退出信号，停止训练...", flush=True)
+                print("[INFO] Exit signal received; stopping training...", flush=True)
             break
 
         try:
@@ -282,7 +291,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, args, grad_loss_fn
             target = frames[:, args.input_length:, :, :, 0]
             mask = frames[:, args.input_length:, :, :, 1]
 
-            # ── 生成器前向 + 基础 L1/结构/演变损失 ──────────────────────────
+            # -- Generator forward + base L1 / structure / evolution losses ------
             optimizer.zero_grad(set_to_none=True)
             with autocast('cuda', enabled=True):
                 gen_out, evo_result, motion = model(frames, return_evo=True)
@@ -298,21 +307,22 @@ def train_one_epoch(model, loader, optimizer, scaler, device, args, grad_loss_fn
                           + args.lambda_evo * evo_l1
                           + args.lambda_motion * motion_reg)
 
-            # ── GAN：判别器一步 + 生成器对抗项 ─────────────────────────────
-            # 判别器全程跑 float32、不用 autocast/scaler_d，彻底避开 AMP+GAN 的
-            # "unscale FP16 gradients" 冲突。判别器小(1.2M)，float32 开销可忽略。
+            # -- GAN: one discriminator step + the generator's adversarial term ---
+            # The discriminator runs entirely in float32 without autocast/scaler_d, which
+            # completely avoids the AMP+GAN "unscale FP16 gradients" conflict. It is small
+            # (1.2M params), so the float32 cost is negligible.
             if disc is not None:
                 input_seq = frames[:, :args.input_length, :, :, 0].float()   # (B, IL, H, W)
                 real_seq = frames[:, :, :, :, 0].float()                     # (B, total, H, W)
                 fake_seq = torch.cat([input_seq, pred.float()], dim=1)       # (B, total, H, W)
 
-                # (1) 训练判别器（float32，普通 backward，无 scaler）
+                # (1) Train the discriminator (float32, plain backward, no scaler)
                 optimizer_d.zero_grad(set_to_none=True)
                 d_real = disc(real_seq)
                 d_fake = disc(fake_seq.detach())
                 d_loss = hinge_loss_d(d_real, d_fake)
                 d_loss.backward()
-                if dist.is_initialized():                                    # 手动同步 D 梯度
+                if dist.is_initialized():                                    # sync D grads manually
                     for p in disc.parameters():
                         if p.grad is not None:
                             dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
@@ -322,8 +332,9 @@ def train_one_epoch(model, loader, optimizer, scaler, device, args, grad_loss_fn
                 dv = d_loss.item()
                 running_d += dv if math.isfinite(dv) else 0.0
 
-                # (2) 生成器对抗项：冻结 D 参数（梯度仍能流回 G），加到 g_loss。
-                #     D 保持冻结到 G 的 backward 做完（在下面 G 步之后再解冻）。
+                # (2) Generator adversarial term: freeze D's parameters (gradients still flow
+                #     back to G) and add it to g_loss. D stays frozen until G's backward is
+                #     done (it is unfrozen after the G step below).
                 if adv_active:
                     for p in disc.parameters():
                         p.requires_grad_(False)
@@ -331,14 +342,14 @@ def train_one_epoch(model, loader, optimizer, scaler, device, args, grad_loss_fn
                     pool = pool_regularization(pred.float(), target.float())
                     g_loss = g_loss + args.lambda_adv * g_adv + args.lambda_pool * pool
 
-            # ── 生成器一步（所有 rank 都 backward，避免 DDP 死锁）──────────
+            # -- Generator step (every rank must backward, or DDP deadlocks) ------
             scaler.scale(g_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             scaler.step(optimizer)
             scaler.update()
 
-            # G 步做完后再解冻 D，供下一个 batch 训练判别器
+            # Unfreeze D after the G step so the next batch can train the discriminator
             if disc is not None and adv_active:
                 for p in disc.parameters():
                     p.requires_grad_(True)
@@ -351,7 +362,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, args, grad_loss_fn
                 nan_batches += 1
                 if local_rank == 0 and nan_batches <= 5:
                     print(f"[WARNING] NaN/Inf loss at batch {batch_idx} "
-                          f"(loss={loss_val})，GradScaler 已自动跳过该步更新", flush=True)
+                          f"(loss={loss_val}); GradScaler skipped this update automatically", flush=True)
 
         except RuntimeError as e:
             if "out of memory" in str(e):
@@ -364,10 +375,10 @@ def train_one_epoch(model, loader, optimizer, scaler, device, args, grad_loss_fn
                 raise e
 
     if local_rank == 0 and nan_batches > 0:
-        print(f"[WARNING] 本epoch共跳过 {nan_batches} 个NaN/Inf batch", flush=True)
+        print(f"[WARNING] Skipped {nan_batches} NaN/Inf batches this epoch", flush=True)
     if local_rank == 0 and disc is not None and valid_batches > 0:
-        print(f"[GAN] 本epoch 判别器平均 loss: {running_d / max(valid_batches,1):.4f} "
-              f"| 对抗项启用: {adv_active}", flush=True)
+        print(f"[GAN] Mean discriminator loss this epoch: {running_d / max(valid_batches,1):.4f} "
+              f"| adversarial term active: {adv_active}", flush=True)
 
     if valid_batches == 0:
         avg_loss = float('nan')
@@ -406,8 +417,8 @@ def append_csv_log(log_file, epoch, train_loss, lr, elapsed_s,
                          f'{csi_mean:.4f}', f'{csi20:.4f}', f'{csi30:.4f}', f'{csi40:.4f}'])
 
 def setup_distributed():
-    # 在 NCCL 初始化前设置心跳超时，覆盖默认 480 秒
-    # 避免 rank 0 扫描数据集时 rank 1/2/3 在 barrier 处触发 watchdog
+    # Raise the NCCL heartbeat timeout before init (default is 480s) so that ranks 1..N
+    # waiting at the barrier do not trip the watchdog while rank 0 scans the dataset
     os.environ.setdefault('TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC', '1800')
 
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -423,7 +434,7 @@ def setup_distributed():
         dist.init_process_group(
             backend='nccl',
             init_method='env://',
-            timeout=timedelta(hours=2),  # 数据扫描可能超过10分钟默认值
+            timeout=timedelta(hours=2),  # dataset scanning can exceed the 10-minute default
         )
         torch.cuda.set_device(local_rank)
     
@@ -434,7 +445,7 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 def unwrap(model):
-    """取出未被 DDP 包裹的原始模型（单卡时 model 本身就是原始模型）。"""
+    """Return the raw model without the DDP wrapper (on a single GPU, model is already raw)."""
     return model.module if hasattr(model, 'module') else model
 
 def main():
@@ -443,15 +454,16 @@ def main():
     parser = argparse.ArgumentParser(description='NowcastNet Multi-GPU Training')
     parser.add_argument('--train_data_path', type=str, default=TRAIN_DATA_PATH)
     parser.add_argument('--cache_dir', type=str, default=CACHE_DIR,
-                        help='预处理 .npy 缓存目录（preprocess_cache.py 生成）。'
-                             '提供后直接 mmap 读取，大幅加速数据加载。设为 none 可禁用')
+                        help='Preprocessed .npy cache dir (produced by preprocess_cache.py). '
+                             'When set, data is memory-mapped directly for much faster loading. '
+                             'Use "none" to disable.')
     parser.add_argument('--save_dir', type=str, default=SAVE_DIR)
     parser.add_argument('--log_file', type=str, default=LOG_FILE)
     
-    parser.add_argument('--batch_size', type=int, default=16, help='每张卡的batch size')
+    parser.add_argument('--batch_size', type=int, default=16, help='per-GPU batch size')
     parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--epochs', type=int, default=1000)
-    parser.add_argument('--num_workers', type=int, default=12, help='每卡数据加载线程数')
+    parser.add_argument('--num_workers', type=int, default=12, help='data-loading threads per GPU')
     parser.add_argument('--prefetch_factor', type=int, default=2)
     
     parser.add_argument('--cleanup_interval', type=int, default=20)
@@ -463,43 +475,46 @@ def main():
     parser.add_argument('--img_width', type=int, default=512)
     parser.add_argument('--ngf', type=int, default=32)
     parser.add_argument('--warp_mode', type=str, default='bilinear', choices=['bilinear', 'nearest'],
-                        help='evolution 迭代 warp 的插值模式。bilinear 可减轻 30 步迭代的'
-                             '累积平滑(台风等精细结构保持更久)；nearest 为原版行为')
+                        help='Interpolation mode for the iterative warp in evolution. '
+                             '"bilinear" enables sub-pixel motion so fine structure survives the '
+                             '30-step rollout; "nearest" is the original behavior.')
     parser.add_argument('--lambda_grad', type=float, default=0.1)
     parser.add_argument('--lambda_evo', type=float, default=1.0,
-                        help='evolution 网络自监督损失权重')
+                        help='weight of the evolution self-supervision loss')
     parser.add_argument('--lambda_motion', type=float, default=0.01,
-                        help='光流场平滑正则权重')
+                        help='weight of the flow-field smoothness regularization')
     parser.add_argument('--fg_thresh_dbz', type=float, default=15.0,
-                        help='前景/背景分界阈值(dBZ)，>=此值算前景单独求均值')
+                        help='foreground/background threshold (dBZ); pixels at or above it are averaged as foreground')
     parser.add_argument('--bg_weight', type=float, default=0.2,
-                        help='背景损失权重，避免满屏噪声但不让背景主导')
-    # ── GAN / 判别器（对抗训练，修复"模糊/强度塌缩"）──
+                        help='background loss weight -- suppresses full-screen noise without letting background dominate')
+    # -- GAN / discriminator (adversarial training; fixes blurring and intensity collapse) --
     parser.add_argument('--gan', action='store_true',
-                        help='开启对抗训练(判别器)。建议从 best_model warm start(--pretrained_model)')
+                        help='enable adversarial training. Recommended to warm start from a best_model via --pretrained_model')
     parser.add_argument('--lambda_adv', type=float, default=0.01,
-                        help='对抗损失权重(生成器)。太大易崩，太小无效果，先用 0.01')
+                        help='adversarial loss weight for the generator. Too high destabilizes training, too low has no effect; start at 0.01')
     parser.add_argument('--lambda_pool', type=float, default=1.0,
-                        help='池化正则权重，约束粗尺度降水量、防止判别器逼模型乱造强回波')
+                        help='pooling regularization weight; constrains coarse-scale rainfall so the discriminator cannot force fabricated strong echoes')
     parser.add_argument('--disc_lr', type=float, default=2e-4,
-                        help='判别器学习率')
+                        help='discriminator learning rate')
     parser.add_argument('--disc_base_c', type=int, default=32,
-                        help='判别器基础通道数')
+                        help='discriminator base channel width')
     parser.add_argument('--disc_warmup_epochs', type=int, default=1,
-                        help='判别器热身轮数：这几轮只训 D、不给 G 加对抗项，稳定后再开')
+                        help='discriminator warm-up epochs: train D only, without adding the adversarial term to G')
     parser.add_argument('--val_fraction', type=float, default=0.1,
-                        help='按文件留出的验证集比例（时间上独立）')
+                        help='fraction of files held out for validation (temporally independent)')
     parser.add_argument('--val_interval', type=int, default=2,
-                        help='每多少个 epoch 在验证集上算一次 CSI')
+                        help='compute validation CSI every N epochs')
     parser.add_argument('--val_max_samples', type=int, default=200,
-                        help='每次验证最多评估多少个样本（控制耗时）')
+                        help='maximum samples evaluated per validation pass (bounds runtime)')
     parser.add_argument('--use_compile', action='store_true', default=False)
     parser.add_argument('--resume_from', type=str, default=None)
     parser.add_argument('--pretrained_model', type=str, default=None,
-                        help='仅加载模型权重作为起点（fine-tune），不恢复optimizer/epoch')
+                        help='load only model weights as a starting point (fine-tune); optimizer/epoch are not restored')
     parser.add_argument('--data_max', dest='data_max_fixed', type=float, default=0.0,
-                        help='手动锁定归一化基准 data_max(>0生效)。换数据集做 warm start 时'
-                             '务必与预训练一致(本项目为 55.5)；留空则从 pretrained_model 继承或自动统计')
+                        help='Pin the normalization reference data_max (>0 to take effect). When '
+                             'warm-starting on a different dataset it MUST match the pretrained '
+                             'value; if left unset it is inherited from --pretrained_model or '
+                             'computed automatically.')
     
     parser.add_argument('--grad_accum_steps', type=int, default=1)
     
@@ -509,20 +524,20 @@ def main():
     
     args = parser.parse_args()
 
-    # 关键修复：如果 num_workers=0，确保 prefetch_factor=None
+    # Important: when num_workers=0, prefetch_factor must be None
     if args.num_workers == 0:
         args.prefetch_factor = None
 
-    # 允许用 --cache_dir none 显式禁用缓存（回退到直接读 NC）
+    # Allow --cache_dir none to explicitly disable the cache (fall back to reading NetCDF)
     if args.cache_dir is not None and args.cache_dir.strip().lower() in ('none', ''):
         args.cache_dir = None
 
     global_batch_size = args.batch_size * world_size
     if rank == 0:
-        print(f"[INFO] 分布式训练: {world_size} 张GPU", flush=True)
-        print(f"[INFO] 每卡Batch Size: {args.batch_size}", flush=True)
-        print(f"[INFO] 全局Batch Size: {global_batch_size}", flush=True)
-        print(f"[INFO] 学习率: {args.lr}", flush=True)
+        print(f"[INFO] Distributed training on {world_size} GPU(s)", flush=True)
+        print(f"[INFO] Per-GPU batch size: {args.batch_size}", flush=True)
+        print(f"[INFO] Global batch size: {global_batch_size}", flush=True)
+        print(f"[INFO] Learning rate: {args.lr}", flush=True)
 
     args.evo_ic = args.total_length - args.input_length
     args.gen_oc = args.total_length - args.input_length
@@ -534,15 +549,15 @@ def main():
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
 
     if device.type == 'cuda':
-        # 所有进程都需要设置，不只是rank 0
+        # Every process must set these, not just rank 0
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision('high')
         torch.backends.cudnn.benchmark = True
         if rank == 0:
             print(f"[INFO] GPU: {torch.cuda.get_device_name(local_rank)}", flush=True)
-            print(f"[INFO] 单卡显存: {torch.cuda.get_device_properties(local_rank).total_memory / 1024**3:.1f}GB", flush=True)
-            print(f"[INFO] 总显存: {torch.cuda.get_device_properties(local_rank).total_memory / 1024**3 * world_size:.1f}GB", flush=True)
+            print(f"[INFO] Per-GPU memory: {torch.cuda.get_device_properties(local_rank).total_memory / 1024**3:.1f}GB", flush=True)
+            print(f"[INFO] Total memory: {torch.cuda.get_device_properties(local_rank).total_memory / 1024**3 * world_size:.1f}GB", flush=True)
 
     mem_monitor = MemoryMonitor(device, local_rank)
     exiter = GracefulExiter()
@@ -550,34 +565,34 @@ def main():
 
     if rank == 0:
         print("="*60, flush=True)
-        print(f"[INFO] 开始分布式训练任务", flush=True)
-        print(f"[INFO] 每卡Batch Size: {args.batch_size}", flush=True)
-        print(f"[INFO] 梯度累积步数: {args.grad_accum_steps}", flush=True)
-        print(f"[INFO] 初始学习率: {args.lr}", flush=True)
-        print(f"[INFO] LR 衰减因子: {args.lr_factor}", flush=True)
-        print(f"[INFO] LR 耐心值: {args.lr_patience}", flush=True)
-        print(f"[INFO] 最小学习率: {args.lr_min}", flush=True)
-        print(f"[INFO] Workers每卡: {args.num_workers}", flush=True)
-        print(f"[INFO] 日志文件: {args.log_file}", flush=True)
+        print(f"[INFO] Starting distributed training", flush=True)
+        print(f"[INFO] Per-GPU batch size: {args.batch_size}", flush=True)
+        print(f"[INFO] Gradient accumulation steps: {args.grad_accum_steps}", flush=True)
+        print(f"[INFO] Initial learning rate: {args.lr}", flush=True)
+        print(f"[INFO] LR decay factor: {args.lr_factor}", flush=True)
+        print(f"[INFO] LR patience: {args.lr_patience}", flush=True)
+        print(f"[INFO] Minimum learning rate: {args.lr_min}", flush=True)
+        print(f"[INFO] Workers per GPU: {args.num_workers}", flush=True)
+        print(f"[INFO] Log file: {args.log_file}", flush=True)
         print("="*60, flush=True)
 
     init_csv_log(args.log_file, rank)
 
     try:
-        # ── Step 1: 确定归一化基准 data_max ────────────────────────────────
-        # 优先级：命令行 --data_max > --pretrained_model 内含的 > 自动统计。
-        # warm start（尤其换数据集时）必须沿用预训练的 data_max，否则归一化尺度
-        # 一变，已训好的权重全部对不上，等于白训。
+        # -- Step 1: determine the normalization reference data_max ------------
+        # Precedence: --data_max > the value stored in --pretrained_model > auto-computed.
+        # A warm start (especially onto a different dataset) MUST reuse the pretrained
+        # data_max; changing the normalization scale invalidates all learned weights.
         cache_file = os.path.join(args.save_dir, 'data_stats.json')
 
         pinned, src = None, ''
         if getattr(args, 'data_max_fixed', 0) and args.data_max_fixed > 0:
-            pinned, src = float(args.data_max_fixed), '命令行 --data_max'
+            pinned, src = float(args.data_max_fixed), '--data_max flag'
         elif args.pretrained_model and os.path.exists(args.pretrained_model):
             try:
                 _c = torch.load(args.pretrained_model, map_location='cpu', weights_only=False)
                 if isinstance(_c, dict) and _c.get('data_max'):
-                    pinned, src = float(_c['data_max']), 'pretrained_model 继承'
+                    pinned, src = float(_c['data_max']), 'inherited from pretrained_model'
                 del _c
             except Exception:
                 pinned = None
@@ -585,11 +600,11 @@ def main():
         if pinned is not None:
             data_max = pinned
             if rank == 0:
-                print(f"[INFO] 使用固定 data_max={data_max:.4f}（{src}，跳过统计扫描）", flush=True)
+                print(f"[INFO] Using pinned data_max={data_max:.4f} ({src}; skipping the statistics scan)", flush=True)
         else:
             if rank == 0:
                 data_max = compute_data_stats(args.train_data_path, percentile=99.9, cache_file=cache_file)
-            # barrier 等 rank 0 写完缓存文件，其余 rank 再读
+            # Barrier so the other ranks read the cache only after rank 0 has written it
             if world_size > 1:
                 dist.barrier()
             if rank != 0:
@@ -597,13 +612,13 @@ def main():
                     data_max = float(json.load(f)['data_max'])
 
         args.data_max = data_max
-        # 强回波权重阈值：对应原始空间约32单位（与data_max成比例）
+        # Strong-echo weighting threshold: ~32 units in the original space, scaled by data_max
         args.heavy_rain_threshold = 32.0 / args.data_max
 
         if rank == 0:
-            print(f"[INFO] data_max={args.data_max:.4f}, 强回波阈值(归一化)={args.heavy_rain_threshold:.4f}", flush=True)
+            print(f"[INFO] data_max={args.data_max:.4f}, strong-echo threshold (normalized)={args.heavy_rain_threshold:.4f}", flush=True)
 
-        # ── Step 2: 加载数据集（仅 rank 0 扫描磁盘，再广播给其他 rank）────────
+        # -- Step 2: load the dataset (only rank 0 scans disk, then broadcasts) --
         if world_size > 1:
             dist.barrier()
 
@@ -624,11 +639,11 @@ def main():
 
         start_time = time.time()
         if rank == 0:
-            print("[INFO] 正在加载数据集（rank 0 扫描）...", flush=True)
+            print("[INFO] Loading dataset (rank 0 scanning)...", flush=True)
             if os.path.exists(samples_cache_file):
                 with open(samples_cache_file, 'rb') as f:
                     all_samples = pickle.load(f)
-                print(f"[INFO] 从缓存加载样本索引，共 {len(all_samples)} 个样本", flush=True)
+                print(f"[INFO] Loaded sample index from cache: {len(all_samples)} samples", flush=True)
             else:
                 full = RadarTrainDataset(
                     data_path=args.train_data_path,
@@ -641,32 +656,32 @@ def main():
                 all_samples = full.samples
                 with open(samples_cache_file, 'wb') as f:
                     pickle.dump(all_samples, f)
-                print(f"[INFO] 样本索引已缓存至: {samples_cache_file}", flush=True)
+                print(f"[INFO] Sample index cached to: {samples_cache_file}", flush=True)
 
-            # ── 按文件留出验证集（时间上独立，避免训练/验证泄漏）──────────────
+            # -- Hold out validation by file (temporally independent, no train/val leakage) --
             files = sorted(set(s[0] for s in all_samples))
             n_val_files = max(1, int(round(len(files) * args.val_fraction)))
             val_files = set(files[-n_val_files:])
             train_samples = [s for s in all_samples if s[0] not in val_files]
             val_samples = [s for s in all_samples if s[0] in val_files]
             load_time = time.time() - start_time
-            print(f"[INFO] 数据集初始化完成，耗时 {load_time:.1f}s", flush=True)
-            print(f"[INFO] 训练样本 {len(train_samples)} 个（{len(files)-n_val_files} 文件），"
-                  f"验证样本 {len(val_samples)} 个（{n_val_files} 文件）", flush=True)
+            print(f"[INFO] Dataset ready in {load_time:.1f}s", flush=True)
+            print(f"[INFO] Train: {len(train_samples)} samples from {len(files)-n_val_files} files; "
+                  f"val: {len(val_samples)} samples from {n_val_files} files", flush=True)
             samples_to_broadcast = [train_samples, val_samples]
         else:
             samples_to_broadcast = [None, None]
 
-        # 将训练样本索引广播给其他 rank（验证只在 rank 0 进行）
+        # Broadcast the training index to the other ranks (validation runs on rank 0 only)
         if world_size > 1:
             dist.broadcast_object_list(samples_to_broadcast, src=0)
 
         dataset = _build_dataset(samples_to_broadcast[0])
 
-        # 验证集仅 rank 0 构建
+        # The validation set is built on rank 0 only
         val_dataset = _build_dataset(samples_to_broadcast[1]) if rank == 0 else None
 
-        # 所有进程同步
+        # Synchronize all processes
         if world_size > 1:
             dist.barrier()
 
@@ -679,7 +694,7 @@ def main():
         )
         
         if args.num_workers > 0:
-            # 線程版加載器：繞過 Docker /dev/shm 限制，IO 並行不需要共享內存
+            # Thread-based loader: bypasses the Docker /dev/shm limit; parallel I/O needs no shared memory
             train_loader = ParallelBatchLoader(
                 dataset,
                 sampler=sampler,
@@ -698,48 +713,49 @@ def main():
                 drop_last=True,
             )
         if rank == 0:
-            print(f"[INFO] DataLoader 创建完成，每卡约 {len(train_loader)} 个batch", flush=True)
+            print(f"[INFO] DataLoader ready: ~{len(train_loader)} batches per GPU", flush=True)
 
         if rank == 0:
-            print("[INFO] 正在初始化模型...", flush=True)
+            print("[INFO] Initializing model...", flush=True)
         model = Net(args).to(device)
         
         total_params = sum(p.numel() for p in model.parameters())
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         if rank == 0:
-            print(f"[INFO] 模型参数: 总计 {total_params/1e6:.1f}M, 可训练 {trainable_params/1e6:.1f}M", flush=True)
+            print(f"[INFO] Model parameters: {total_params/1e6:.1f}M total, {trainable_params/1e6:.1f}M trainable", flush=True)
         
-        # 加载预训练权重（fine-tune 起点，不恢复 optimizer/epoch）
-        pretrained_disc_sd = None   # 若 ckpt 里带判别器，稍后创建 disc 时一并继承
+        # Load pretrained weights as a fine-tuning start (optimizer/epoch are not restored)
+        pretrained_disc_sd = None   # if the ckpt carries a discriminator, inherit it later
         if args.pretrained_model and os.path.exists(args.pretrained_model):
             if rank == 0:
-                print(f"[INFO] 加载预训练权重: {args.pretrained_model}", flush=True)
+                print(f"[INFO] Loading pretrained weights: {args.pretrained_model}", flush=True)
             ckpt = torch.load(args.pretrained_model, map_location=device, weights_only=False)
             state_dict = ckpt.get('model_state_dict', ckpt) if isinstance(ckpt, dict) else ckpt
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
             if isinstance(ckpt, dict):
                 pretrained_disc_sd = ckpt.get('disc_state_dict', None)
             if rank == 0:
-                print(f"[INFO] 预训练权重加载完成 (missing={len(missing)}, unexpected={len(unexpected)})", flush=True)
+                print(f"[INFO] Pretrained weights loaded (missing={len(missing)}, unexpected={len(unexpected)})", flush=True)
 
         if args.use_compile and hasattr(torch, 'compile'):
             if rank == 0:
-                print("[INFO] 正在应用 torch.compile...", flush=True)
+                print("[INFO] Applying torch.compile...", flush=True)
             model = torch.compile(model)
 
         if world_size > 1:
             model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
         elif rank == 0:
-            print("[INFO] 单卡训练，跳过 DDP 包裹", flush=True)
+            print("[INFO] Single-GPU training; skipping the DDP wrapper", flush=True)
 
         scaled_lr = args.lr * math.sqrt(world_size)
         if rank == 0:
-            print(f"[INFO] 缩放后学习率: {scaled_lr:.2e} (原 {args.lr:.2e} * sqrt({world_size}))", flush=True)
+            print(f"[INFO] Scaled learning rate: {scaled_lr:.2e} ({args.lr:.2e} * sqrt({world_size}))", flush=True)
         
         optimizer = optim.AdamW(model.parameters(), lr=scaled_lr, weight_decay=1e-5, fused=False)
         
-        # 以验证集 CSI 为调度依据（越大越好）。CSI=0 时空白预报无法蒙混过关，
-        # 比监控 train_loss 可靠得多（旧方案在 loss≈1e-5 时阈值失效，LR 永不下降）。
+        # Schedule on validation CSI (higher is better). A blank forecast cannot sneak past
+        # a CSI of 0, making this far more reliable than watching train_loss (with loss ~1e-5
+        # the old threshold never triggered and the LR never decayed).
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode='max',
@@ -751,52 +767,54 @@ def main():
         scaler = GradScaler('cuda')
         grad_loss_fn = SobelGradientLoss().to(device)
 
-        # ── GAN：判别器（原始模块，不套 DDP；多卡时在 train_one_epoch 里手动同步梯度）──
+        # -- GAN discriminator: a raw module (no DDP); gradients are synced manually inside
+        #    train_one_epoch under multi-GPU --
         disc = optimizer_d = scaler_d = None
         if args.gan:
             disc = Temporal_Discriminator(args.total_length, base_c=args.disc_base_c).to(device)
-            # 若预训练 ckpt 里带判别器（上一轮 GAN 训练的产物），一并继承，避免 D 从零重来
+            # If the pretrained ckpt carries a discriminator (from a previous GAN run),
+            # inherit it so D does not restart from scratch
             if pretrained_disc_sd is not None:
                 try:
                     disc.load_state_dict(pretrained_disc_sd)
                     if rank == 0:
-                        print("[INFO] 判别器已从 --pretrained_model 继承（继续对抗，不从零开始）", flush=True)
+                        print("[INFO] Discriminator inherited from --pretrained_model (adversarial training continues)", flush=True)
                 except Exception as e:
                     if rank == 0:
-                        print(f"[WARNING] 判别器继承失败（结构不匹配？），从零初始化: {e}", flush=True)
+                        print(f"[WARNING] Could not inherit discriminator (architecture mismatch?); initializing from scratch: {e}", flush=True)
             optimizer_d = optim.AdamW(disc.parameters(), lr=args.disc_lr,
                                       betas=(0.0, 0.9), weight_decay=0.0, fused=False)
             scaler_d = GradScaler('cuda')
             if rank == 0:
                 nd = sum(p.numel() for p in disc.parameters()) / 1e6
-                print(f"[INFO] GAN 开启：判别器 {nd:.1f}M | disc_lr={args.disc_lr:.2e} | "
+                print(f"[INFO] GAN enabled: discriminator {nd:.1f}M | disc_lr={args.disc_lr:.2e} | "
                       f"lambda_adv={args.lambda_adv} lambda_pool={args.lambda_pool} | "
-                      f"热身 {args.disc_warmup_epochs} 轮", flush=True)
+                      f"warm-up {args.disc_warmup_epochs} epoch(s)", flush=True)
 
         start_epoch = 1
         if args.resume_from and os.path.exists(args.resume_from):
             if rank == 0:
-                print(f"[INFO] 从检查点恢复: {args.resume_from}", flush=True)
-            # 所有rank都加载，保证多卡权重一致
+                print(f"[INFO] Resuming from checkpoint: {args.resume_from}", flush=True)
+            # Every rank loads it so weights stay identical across GPUs
             checkpoint = torch.load(args.resume_from, map_location=device, weights_only=False)
             unwrap(model).load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             start_epoch = checkpoint['epoch'] + 1
             if 'scheduler_state_dict' in checkpoint:
                 scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            # 恢复判别器（若 checkpoint 里有且本次开启了 GAN）
+            # Restore the discriminator (if present in the checkpoint and GAN is enabled)
             if args.gan and disc is not None and checkpoint.get('disc_state_dict'):
                 disc.load_state_dict(checkpoint['disc_state_dict'])
                 if checkpoint.get('disc_optimizer_state_dict'):
                     optimizer_d.load_state_dict(checkpoint['disc_optimizer_state_dict'])
                 if rank == 0:
-                    print("[INFO] 判别器已从检查点恢复", flush=True)
-            # 如果checkpoint保存了data_max，优先使用（覆盖扫描结果）
+                    print("[INFO] Discriminator restored from checkpoint", flush=True)
+            # Prefer the checkpoint's data_max if present (overrides the scan result)
             if 'data_max' in checkpoint and checkpoint['data_max'] is not None:
                 args.data_max = float(checkpoint['data_max'])
                 args.heavy_rain_threshold = 32.0 / args.data_max
             if rank == 0:
-                print(f"[INFO] 从 epoch {start_epoch} 继续训练，data_max={args.data_max:.4f}", flush=True)
+                print(f"[INFO] Resuming at epoch {start_epoch}, data_max={args.data_max:.4f}", flush=True)
 
         loss_history = []
         best_csi = -1.0
@@ -804,14 +822,14 @@ def main():
         for epoch in range(start_epoch, args.epochs + 1):
             if exiter.should_exit:
                 if rank == 0:
-                    print("[INFO] 收到退出信号，保存模型...", flush=True)
+                    print("[INFO] Exit signal received; saving the model...", flush=True)
                 break
 
             epoch_start = time.time()
 
             sampler.set_epoch(epoch)
 
-            # 判别器热身：前 disc_warmup_epochs 轮只训 D，不给 G 加对抗项
+            # Discriminator warm-up: for the first disc_warmup_epochs, train D only
             adv_active = args.gan and (epoch > args.disc_warmup_epochs)
             avg_loss = train_one_epoch(
                 model, train_loader, optimizer, scaler,
@@ -825,7 +843,7 @@ def main():
             loss_history.append(avg_loss)
             current_lr = optimizer.param_groups[0]['lr']
 
-            # ── 验证：每 val_interval 个 epoch 在留出集上算 CSI ──────────────
+            # -- Validation: compute CSI on the held-out set every val_interval epochs --
             run_val = (epoch % args.val_interval == 0) or (epoch == args.epochs)
             csi_dict, mean_csi = {20.0: 0.0, 30.0: 0.0, 40.0: 0.0}, -1.0
             if run_val:
@@ -833,7 +851,7 @@ def main():
                     csi_dict, mean_csi = evaluate_csi(
                         unwrap(model), val_dataset, device, args, args.val_max_samples
                     )
-                # 把 CSI 广播给所有 rank，保证调度器/LR 在多卡间一致
+                # Broadcast CSI to all ranks so the scheduler/LR stay consistent
                 csi_tensor = torch.tensor(
                     [mean_csi, csi_dict[20.0], csi_dict[30.0], csi_dict[40.0]],
                     device=device, dtype=torch.float32,
@@ -851,7 +869,7 @@ def main():
                     val_str = (f" | CSI(mean/20/30/40): {mean_csi:.4f}/"
                                f"{csi_dict[20.0]:.4f}/{csi_dict[30.0]:.4f}/{csi_dict[40.0]:.4f}")
                 print(f"[Epoch {epoch:3d}/{args.epochs}] Loss: {avg_loss:.6f} | "
-                      f"LR: {current_lr:.2e} | 耗时: {epoch_time/3600:.2f}h "
+                      f"LR: {current_lr:.2e} | elapsed: {epoch_time/3600:.2f}h "
                       f"({epoch_time:.1f}s){val_str}", flush=True)
 
                 append_csv_log(
@@ -860,13 +878,13 @@ def main():
                     csi_dict[20.0], csi_dict[30.0], csi_dict[40.0], rank
                 )
 
-            # 仅在验证轮用 CSI 推进调度器（mode='max'）
+            # Step the scheduler on CSI only during validation epochs (mode='max')
             if run_val and math.isfinite(mean_csi) and mean_csi >= 0:
                 scheduler.step(mean_csi)
 
             new_lr = optimizer.param_groups[0]['lr']
             if rank == 0 and new_lr < current_lr:
-                print(f"  📉 学习率已降低: {current_lr:.2e} → {new_lr:.2e}", flush=True)
+                print(f"  [LR] reduced: {current_lr:.2e} -> {new_lr:.2e}", flush=True)
 
             if rank == 0:
                 raw_model = unwrap(model)
@@ -888,13 +906,13 @@ def main():
                 if epoch % 5 == 0 or epoch == args.epochs:
                     checkpoint_path = os.path.join(args.save_dir, f'checkpoint_epoch_{epoch}.ckpt')
                     _save(checkpoint_path)
-                    print(f"[INFO] 检查点已保存: {checkpoint_path}", flush=True)
+                    print(f"[INFO] Checkpoint saved: {checkpoint_path}", flush=True)
 
-                # 按验证 CSI 保存最优模型
+                # Save the best model by validation CSI
                 if run_val and mean_csi > best_csi:
                     best_csi = mean_csi
                     _save(os.path.join(args.save_dir, 'best_model.ckpt'))
-                    print(f"[INFO] 🏆 新的最优模型 (CSI={best_csi:.4f})", flush=True)
+                    print(f"[INFO] New best model (CSI={best_csi:.4f})", flush=True)
 
                 latest_path = os.path.join(args.save_dir, 'latest_model.ckpt')
                 torch.save(raw_model.state_dict(), latest_path)
@@ -904,16 +922,16 @@ def main():
 
         if rank == 0:
             print("="*60, flush=True)
-            print("[INFO] 训练完成！", flush=True)
+            print("[INFO] Training complete.", flush=True)
             if loss_history:
-                print(f"[INFO] 最终 Loss: {loss_history[-1]:.6f}", flush=True)
-                print(f"[INFO] 最优验证 CSI: {best_csi:.4f}", flush=True)
-            print(f"[INFO] 日志已保存到: {args.log_file}", flush=True)
+                print(f"[INFO] Final loss: {loss_history[-1]:.6f}", flush=True)
+                print(f"[INFO] Best validation CSI: {best_csi:.4f}", flush=True)
+            print(f"[INFO] Log saved to: {args.log_file}", flush=True)
             print("="*60, flush=True)
                 
     except Exception as e:
         if rank == 0:
-            print(f"\n[ERROR] 训练发生错误: {e}", flush=True)
+            print(f"\n[ERROR] Training failed: {e}", flush=True)
             traceback.print_exc()
         
         try:
@@ -925,7 +943,7 @@ def main():
                     'model_state_dict': raw_model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict() if 'optimizer' in locals() else None,
                 }, emergency_path)
-                print(f"[INFO] 紧急检查点已保存: {emergency_path}", flush=True)
+                print(f"[INFO] Emergency checkpoint saved: {emergency_path}", flush=True)
         except:
             pass
         

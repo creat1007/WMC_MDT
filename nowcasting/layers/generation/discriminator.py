@@ -5,24 +5,26 @@ from nowcasting.layers.utils import spectral_norm
 
 
 class Temporal_Discriminator(nn.Module):
-    """时空判别器（NowcastNet/DGMR 风格）。
+    """Spatiotemporal discriminator (NowcastNet / DGMR style).
 
-    输入整段序列 (B, T, H, W)（输入帧 + 未来帧拼接），
-    判别其时空演变是否「像真实雷达」。用 3D 卷积抓时空结构，再压掉时间维转 2D
-    继续下采样，spectral_norm 稳定训练，输出一张打分图（配 hinge loss）。
+    Takes the full sequence (B, T, H, W) -- input frames concatenated with future frames --
+    and judges whether its spatiotemporal evolution "looks like real radar". 3D convolutions
+    capture spatiotemporal structure, then the time axis is pooled away and 2D convolutions
+    continue downsampling. Spectral norm stabilizes training; the output is a score map
+    (used with a hinge loss).
 
-    首层用较大空间步长(stride=(2,4,4))做激进下采样，控制显存。
+    The first layer downsamples aggressively (stride=(2,4,4)) to keep memory in check.
     """
 
     def __init__(self, in_frames, base_c=32):
         super().__init__()
         sn = spectral_norm
-        # 3D 时空卷积
+        # 3D spatiotemporal convolutions
         self.c3d_1 = sn(nn.Conv3d(1, base_c, kernel_size=(4, 9, 9),
                                   stride=(2, 4, 4), padding=(1, 4, 4)))
         self.c3d_2 = sn(nn.Conv3d(base_c, base_c * 2, kernel_size=(4, 5, 5),
                                   stride=(2, 2, 2), padding=(1, 2, 2)))
-        # 压掉时间维后转 2D 继续下采样
+        # Pool away the time axis, then continue downsampling in 2D
         self.c2d_1 = sn(nn.Conv2d(base_c * 2, base_c * 4, kernel_size=3, stride=2, padding=1))
         self.c2d_2 = sn(nn.Conv2d(base_c * 4, base_c * 8, kernel_size=3, stride=2, padding=1))
         self.c2d_3 = sn(nn.Conv2d(base_c * 8, base_c * 8, kernel_size=3, stride=1, padding=1))
@@ -33,28 +35,29 @@ class Temporal_Discriminator(nn.Module):
         x = x.unsqueeze(1)
         x = F.leaky_relu(self.c3d_1(x), 0.2)
         x = F.leaky_relu(self.c3d_2(x), 0.2)
-        x = x.mean(dim=2)                      # 压掉时间维 → (B, C, H', W')
+        x = x.mean(dim=2)                      # collapse time -> (B, C, H', W')
         x = F.leaky_relu(self.c2d_1(x), 0.2)
         x = F.leaky_relu(self.c2d_2(x), 0.2)
         x = F.leaky_relu(self.c2d_3(x), 0.2)
-        return self.out(x)                     # (B, 1, h, w) 打分图
+        return self.out(x)                     # (B, 1, h, w) score map
 
 
-# ── 损失函数 ────────────────────────────────────────────────────────────────
+# -- Losses -----------------------------------------------------------------
 
 def hinge_loss_d(real_score, fake_score):
-    """判别器 hinge 损失：真样本推向 >1，假样本推向 <-1。"""
+    """Discriminator hinge loss: push real samples above +1 and fakes below -1."""
     return F.relu(1.0 - real_score).mean() + F.relu(1.0 + fake_score).mean()
 
 
 def hinge_loss_g(fake_score):
-    """生成器对抗损失：让判别器认为假样本是真（分数越高越好）。"""
+    """Generator adversarial loss: make the discriminator score fakes as real."""
     return -fake_score.mean()
 
 
 def pool_regularization(gen, real, kernel=8):
-    """池化正则（NowcastNet）：约束生成场与真实场在粗尺度(区域平均)上一致，
-    防止判别器逼生成器凭空造出不合理的强回波。gen/real: (B, T, H, W)。"""
+    """Pooling regularization (NowcastNet): keeps generated and real fields consistent at
+    coarse scale (area means), preventing the discriminator from pushing the generator to
+    fabricate unrealistic strong echoes. gen/real: (B, T, H, W)."""
     b, t, h, w = gen.shape
     g = F.avg_pool2d(gen.reshape(b * t, 1, h, w), kernel)
     r = F.avg_pool2d(real.reshape(b * t, 1, h, w), kernel)

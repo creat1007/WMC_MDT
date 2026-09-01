@@ -48,7 +48,7 @@ class InputHandle(Dataset):
             
             data = ds[var_names[0]].values
             
-            # 反转y轴
+            # Flip y axis
             if data.ndim == 3:
                 data = data[:, ::-1, :]
             elif data.ndim == 2:
@@ -66,7 +66,7 @@ class InputHandle(Dataset):
             if data.ndim != 3:
                 return np.zeros((self.input_length, self.img_height, self.img_width))
             
-            # 数据单位为 0.1 dBZ（存储值 = dBZ × 10），转换为真实 dBZ
+            # Stored unit is 0.1 dBZ (value = dBZ x 10); convert to true dBZ
             data = data / 10.0
 
             if data.shape[0] < self.input_length:
@@ -92,7 +92,7 @@ class InputHandle(Dataset):
             img = cv2.imread(img_path, 2)
             data.append(np.expand_dims(img, axis=0))
         
-        # 与训练/nc路径一致：仅 /10 转 dBZ（去掉原版遗留的 -3.0 偏移）
+        # Match training / NetCDF path: only /10 to dBZ (drop the legacy -3.0 offset)
         data = np.concatenate(data, axis=0).astype(self.input_data_type) / 10.0
         
         if data.shape[1] != self.img_height or data.shape[2] != self.img_width:
@@ -118,7 +118,7 @@ class InputHandle(Dataset):
         mask = np.ones_like(data)
         mask[data < 0] = 0
         data[data < 0] = 0
-        # 与训练保持一致：用 data_max 归一化到 [0, 1]
+        # Match training: normalize to [0, 1] with data_max
         data = data / self.data_max
         
         vid = np.zeros((self.input_length, self.img_height, self.img_width, 2))

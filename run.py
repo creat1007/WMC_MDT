@@ -33,7 +33,7 @@ parser.add_argument('--batch_size', type=int, default=1)
 parser.add_argument('--num_save_samples', type=int, default=10)
 parser.add_argument('--ngf', type=int, default=32)
 parser.add_argument('--warp_mode', type=str, default='bilinear', choices=['bilinear', 'nearest'],
-                    help='evolution 迭代 warp 插值模式，必须与训练时一致')
+                    help='Warp interpolation mode for evolution; must match training')
 parser.add_argument('--dataset_path', type=str)
 parser.add_argument('--forecast_only', action='store_true')
 parser.add_argument('--lon_min', type=float, default=111.61)
@@ -50,17 +50,17 @@ args.evo_ic = args.total_length - args.input_length
 args.gen_oc = args.total_length - args.input_length
 args.ic_feature = args.ngf * 10
 
-# 从checkpoint读取data_max，保证推断归一化与训练一致
-args.data_max = 80.0  # 默认值，会被checkpoint覆盖
+# Read data_max from checkpoint so inference normalization matches training
+args.data_max = 80.0  # default; overridden by checkpoint
 if args.pretrained_model and os.path.exists(args.pretrained_model):
     try:
         _ckpt = torch.load(args.pretrained_model, map_location='cpu', weights_only=False)
         if isinstance(_ckpt, dict) and 'data_max' in _ckpt and _ckpt['data_max'] is not None:
             args.data_max = float(_ckpt['data_max'])
-            print(f"[INFO] 从checkpoint读取 data_max={args.data_max:.4f}", flush=True)
+            print(f"[INFO] data_max read from checkpoint: {args.data_max:.4f}", flush=True)
         del _ckpt
     except Exception as e:
-        print(f"[WARNING] 无法从checkpoint读取data_max，使用默认值{args.data_max}: {e}", flush=True)
+        print(f"[WARNING] Could not read data_max from checkpoint, using default {args.data_max}: {e}", flush=True)
 
 def safe_makedirs(path):
     if not path.startswith('./') and not path.startswith('/'):

@@ -1,31 +1,31 @@
-# WMC_MDT — 雷达回波临近预报模型
+# WMC_MDT — Radar Echo Nowcasting Model
 
-基于 [NowcastNet](https://www.nature.com/articles/s41586-023-06184-4) 的雷达外推临近预报系统，
-针对中国区域（华北 / 华南）业务化改造与训练。
+A radar extrapolation nowcasting system based on [NowcastNet](https://www.nature.com/articles/s41586-023-06184-4),
+adapted and trained for operational use over China (North China / South China).
 
-**输入过去 20 帧（2 小时），预报未来 30 帧（3 小时），帧间隔 6 分钟。**
-
----
-
-## 主要特性
-
-- **物理-生成混合架构**：Evolution 网络学习光流平流演变，Generative 网络（含判别器）负责细节生成
-- **对抗训练（GAN）**：时空判别器 + 池化正则，输出锐利、有强回波核的预报场，避免 L1 回归的过度平滑
-- **频率平衡损失**：前景/背景分别求均值，解决雷达场 99% 是零背景导致的模型塌缩
-- **多区域混合训练**：支持华北 + 华南数据混合，一个模型覆盖多区域
-- **业务化就绪**：单层（组合反射率）+ 多层（12 个高度层）双流水线，支持实时定时运行
+**Input: past 20 frames (2 hours) → Output: next 30 frames (3 hours), at 6-minute intervals.**
 
 ---
 
-## 快速开始
+## Features
 
-### 环境
+- **Physics-generative hybrid architecture**: an Evolution network learns optical-flow advection, while a Generative network (with a discriminator) synthesizes fine-scale detail
+- **Adversarial training (GAN)**: spatiotemporal discriminator + pooling regularization, producing sharp fields with realistic convective cores instead of the over-smoothed output typical of L1 regression
+- **Frequency-balanced loss**: foreground and background are averaged separately, preventing the model collapse caused by radar fields being ~99% zero background
+- **Multi-region joint training**: North + South China data can be mixed into a single model
+- **Operational-ready**: single-level (composite reflectivity) and multi-level (12 height levels) pipelines, suitable for scheduled real-time runs
+
+---
+
+## Quick Start
+
+### Environment
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 训练
+### Training
 
 ```bash
 python train.py \
@@ -38,17 +38,18 @@ python train.py \
     --save_dir ./checkpoints
 ```
 
-多卡：`torchrun --nproc_per_node=4 train.py ...`
+Multi-GPU: `torchrun --nproc_per_node=4 train.py ...`
 
-**从已有模型继续训练（warm start）**：
+**Warm start from an existing model:**
 
 ```bash
 python train.py --pretrained_model ./checkpoints/best_model.ckpt --data_max 55.5 ...
 ```
 
-> ⚠️ 换数据集做 warm start 时，`--data_max` 必须与预训练一致，否则归一化尺度改变会使已训权重失效。
+> ⚠️ When warm-starting on a different dataset, `--data_max` **must** match the pretrained value.
+> Changing the normalization scale invalidates the learned weights.
 
-### 推理
+### Inference
 
 ```bash
 python run.py \
@@ -61,15 +62,15 @@ python run.py \
     --warp_mode bilinear
 ```
 
-### 数据预处理（可选，大幅加速）
+### Data Preprocessing (optional, large speedup)
 
-把 NetCDF 预处理成 `.npy` 缓存，训练时 mmap 直读：
+Convert NetCDF into `.npy` caches for memory-mapped reads during training:
 
 ```bash
 python preprocess_cache.py --data_path /path/to/nc_dir --cache_dir /path/to/cache
 ```
 
-彩色雷达图（PNG）转 dBZ 训练数据：
+Convert colored radar images (PNG) into dBZ training data:
 
 ```bash
 python preprocess_cache.py --input_type image \
@@ -79,79 +80,84 @@ python preprocess_cache.py --input_type image \
 
 ---
 
-## 目录结构
+## Repository Layout
 
 ```
-├── train.py                    # 训练主程序（GAN / warm start / 多卡）
-├── run.py                      # 推理
-├── preprocess_cache.py         # 数据预处理（NC / 彩色图 → npy）
-├── revive_flow.py              # 修复光流层权重坍缩（见下）
-├── diagnose_typhoon.py         # 诊断：区分平流阶段 vs 生成阶段的结构损失
+├── train.py                    # Training (GAN / warm start / multi-GPU)
+├── run.py                      # Inference
+├── preprocess_cache.py         # Preprocessing (NetCDF / colored images → npy)
+├── revive_flow.py              # Fix for optical-flow layer weight collapse (see below)
+├── diagnose_typhoon.py         # Diagnostic: isolate structure loss in advection vs. generation
 └── nowcasting/
-    ├── models/nowcastnet.py            # 主模型
-    ├── layers/evolution/               # Evolution 网络（光流 + 强度）
-    ├── layers/generation/              # Generative 网络
-    │   └── discriminator.py            # 时空判别器 + hinge loss + 池化正则
-    └── data_provider/                  # 数据加载
+    ├── models/nowcastnet.py            # Main model
+    ├── layers/evolution/               # Evolution network (optical flow + intensity)
+    ├── layers/generation/              # Generative network
+    │   └── discriminator.py            # Spatiotemporal discriminator + hinge loss + pooling reg.
+    └── data_provider/                  # Data loading
 ```
 
 ---
 
-## 训练要点
+## Training Notes
 
-### 关键超参
+### Key Hyperparameters
 
-| 参数 | 说明 | 建议值 |
+| Argument | Description | Suggested |
 |---|---|---|
-| `--data_max` | 归一化基准（dBZ）。warm start 时必须与预训练一致 | `55.5` |
-| `--lambda_adv` | 对抗损失权重。太大易崩，太小无锐化效果 | `0.03` |
-| `--lambda_pool` | 池化正则，约束粗尺度水量、防止判别器逼模型乱造强回波 | `0.5` |
-| `--lambda_evo` | Evolution 自监督权重 | `3.0` |
-| `--lambda_motion` | 光流平滑正则。过大会压制旋转等高梯度流场 | `0.0003` |
-| `--warp_mode` | **必须用 `bilinear`**（见下） | `bilinear` |
+| `--data_max` | Normalization reference (dBZ). Must match the pretrained value when warm-starting | `55.5` |
+| `--lambda_adv` | Adversarial loss weight. Too high destabilizes training; too low gives no sharpening | `0.03` |
+| `--lambda_pool` | Pooling regularization; constrains coarse-scale rainfall so the discriminator cannot push the model to fabricate strong echoes | `0.5` |
+| `--lambda_evo` | Evolution self-supervision weight | `3.0` |
+| `--lambda_motion` | Optical-flow smoothness regularization. Too large suppresses high-gradient flow such as rotation | `0.0003` |
+| `--warp_mode` | **Must be `bilinear`** (see below) | `bilinear` |
 
-### 评估
+### Evaluation
 
-训练中每 `--val_interval` 轮在留出验证集上计算 **CSI**（20/30/40 dBZ）。
+**CSI** (at 20/30/40 dBZ) is computed on a held-out validation set every `--val_interval` epochs.
 
-> **注意**：GAN 训练下 CSI 可能略降而观感明显变好——CSI 惩罚"位置稍偏的锐利强核"，
-> 却奖励模糊的平均场。判断模型质量应以**个例可视化为主，CSI 为辅**。
+> **Note**: under GAN training, CSI may drop slightly while visual quality clearly improves.
+> CSI penalizes sharp cores that are slightly displaced, yet rewards blurry mean fields.
+> Judge model quality primarily by **case visualization**, with CSI as a secondary indicator.
 
 ---
 
-## 开发中发现的关键问题
+## Issues Found During Development
 
-记录几个排查过程中定位到的、影响很大的问题，供参考。
+A few high-impact problems identified while debugging this system, documented for reference.
 
-### 1. 模型塌缩为空白输出
+### 1. Model collapse to blank output
 
-纯 L1 损失下，雷达场 99% 是零背景，模型输出全零即可让 loss 降到 ~1e-5，
-形成"假收敛"（loss 持续下降但 CSI 恒为 0）。
+Under a plain L1 loss, radar fields are ~99% zero background, so predicting all-zeros drives the
+loss down to ~1e-5 — a false convergence where the loss keeps decreasing but CSI stays at 0.
 
-**解决**：`balanced_l1` —— 前景（≥15 dBZ）与背景分别求均值再加权相加，
-前景不被海量背景稀释；并引入有效掩膜、按 dBZ 分级加权。
+**Fix**: `balanced_l1` — foreground (≥15 dBZ) and background are averaged *separately* and then
+combined, so foreground error is never diluted by the vast background. A validity mask and
+dBZ-graded weighting were added as well.
 
-### 2. 预报过度平滑、强度塌缩
+### 2. Over-smoothed forecasts and intensity collapse
 
-L1 回归倾向输出"安全的平均场"：强核被抹平、回波摊成大片弱区。
+L1 regression favors a "safe" mean field: convective cores are flattened and echoes spread into
+broad weak regions.
 
-**解决**：重新引入 NowcastNet 的对抗训练（时空判别器 + hinge loss + 池化正则）。
-从 L1 预训练模型 warm start 做对抗微调，比从零训 GAN 稳定得多。
+**Fix**: reintroduce NowcastNet's adversarial training (spatiotemporal discriminator + hinge loss
++ pooling regularization). Warm-starting the adversarial phase from an L1-pretrained model is far
+more stable than training a GAN from scratch.
 
-### 3. 光流层权重坍缩（`revive_flow.py`）
+### 3. Optical-flow layer weight collapse (`revive_flow.py`)
 
-**现象**：预报中回波几乎不移动，结构在 1 小时内被"抹匀"；
-调整任何损失权重，输出的光流场都一模一样、纹丝不动。
+**Symptom**: echoes barely moved; structure was smeared out within an hour. Regardless of which
+loss weight was tuned, the predicted flow field came out *bit-for-bit identical*.
 
-**根因**：`warp` 使用 `mode="nearest"`，而模型预测的位移仅 ~0.02–0.2 像素/帧，
-最近邻取整后位移归零 → 光流对结果无影响 → 梯度≈0 → `outc_v` 权重坍缩到 std≈1e-4
-→ 输出退化为常数场 → 永远学不动（自锁死循环）。
+**Root cause**: `warp` used `mode="nearest"`, while the model's predicted displacement was only
+~0.02–0.2 px/frame. Nearest-neighbor rounding truncated that to zero, so the flow had no effect on
+the output → gradient ≈ 0 → the `outc_v` weights collapsed to std ≈ 1e-4 → the flow degenerated
+into a constant field and could never recover (a self-locking loop).
 
-**解决**：
-1. `warp` 改用 `bilinear`（支持亚像素位移且可导）；
-2. `revive_flow.py` 重新初始化坍缩的 `outc_v` 层并清空优化器状态，再 warm start。
+**Fix**:
+1. switch `warp` to `bilinear` (sub-pixel capable and differentiable);
+2. `revive_flow.py` re-initializes the collapsed `outc_v` layer and clears optimizer state, then warm-start.
 
-修复后光流量级增长约 15 倍，回波恢复真实平流。
+After the fix, flow magnitude grew ~15×, restoring genuine advection.
 
 ```bash
 python revive_flow.py --ckpt old.ckpt --out revived.ckpt
@@ -160,21 +166,24 @@ python train.py --pretrained_model revived.ckpt --warp_mode bilinear --lr 1e-4 .
 
 ---
 
-## 已知局限
+## Known Limitations
 
-- **台风等强旋转系统**：2–3 小时后螺旋结构仍难以维持。光流量级虽已修复，
-  但单一 U-Net 难以学出维持涡旋所需的连贯旋转场。1 小时内可参考。
-- **对流新生**：纯雷达外推无法预报"凭空生成"的新对流，这是该类方法的固有局限。
-- **移速偏慢**：系统加速/转向在过去帧中无信息，外推模型倾向低估。
+- **Typhoons and strongly rotating systems**: spiral structure is still hard to maintain beyond
+  2–3 hours. Flow magnitude is fixed, but a single U-Net struggles to learn the coherent rotational
+  field needed to sustain a vortex. Usable within ~1 hour.
+- **Convective initiation**: pure radar extrapolation cannot predict newly developing convection —
+  an inherent limitation of this class of methods.
+- **Underestimated propagation speed**: acceleration and track changes carry no signal in past
+  frames, so extrapolation models tend to lag.
 
-后续方向：融合数值模式（NWP）风场引导 evolution 网络。
+Planned direction: incorporate NWP wind fields to guide the Evolution network.
 
 ---
 
-## 致谢
+## Acknowledgements
 
-- 模型架构基于 [NowcastNet](https://github.com/thuml/NowcastNet)（Zhang et al., *Nature* 2023）
+- Architecture based on [NowcastNet](https://github.com/thuml/NowcastNet) (Zhang et al., *Nature* 2023)
 
 ## License
 
-见 [LICENSE](LICENSE)。
+See [LICENSE](LICENSE).

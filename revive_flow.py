@@ -1,27 +1,27 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-复活 evolution 网络的光流输出层（outc_v）。
+Revive the optical-flow output layer (outc_v) of the Evolution network.
 
-背景（诊断结论）：
-  evo_net.outc_v.conv.weight 的 std 已坍缩到 1.2e-4（强度分支是 0.186，差 1500 倍），
-  光流输出退化成"只剩 bias 的常数场"，导致：
-    - 流场 |v| 恒为 0.03~0.23 像素/帧（台风真实位移应为 ~5 像素/帧），
-    - 无论怎么调 lambda_motion / lambda_evo，|v| 一模一样纹丝不动（自锁死循环：
-      输出≈常数 → 梯度≈0 → 永远学不动）。
-  → 台风"原地不动然后糊掉"的根因。
+Background (diagnosis):
+  evo_net.outc_v.conv.weight had collapsed to std 1.2e-4 (the intensity branch is 0.186,
+  a 1500x difference), degenerating the flow output into a "bias-only constant field":
+    - flow magnitude |v| stuck at 0.03-0.23 px/frame (a real typhoon needs ~5 px/frame);
+    - |v| stayed bit-for-bit identical no matter how lambda_motion / lambda_evo were tuned
+      (a self-locking loop: output ~ constant -> gradient ~ 0 -> can never learn).
+  This was the root cause of typhoons "staying put and then smearing out".
 
-本脚本：
-  从已有 checkpoint 出发，只重新初始化 outc_v 的 weight/bias（其余权重全部保留），
-  让光流分支重新获得有效梯度，然后用它 warm start 继续训练。
+This script:
+  Starting from an existing checkpoint, re-initializes only outc_v's weight/bias (all other
+  weights are preserved) so the flow branch regains a useful gradient, then warm-start from it.
 
-用法：
+Usage:
     python revive_flow.py \
         --ckpt     ./checkpoints_v4/checkpoint_epoch_10.ckpt \
         --out      ./checkpoints_v4/revived_ep10.ckpt \
-        --flow_std 0.05        # 重新初始化的权重标准差（默认 0.05）
+        --flow_std 0.05        # std of the re-initialized weights (default 0.05)
 
-之后用 --pretrained_model 指向 --out 产物继续训练即可。
+Then continue training with --pretrained_model pointing at the --out file.
 """
 import os
 import argparse
@@ -30,69 +30,71 @@ import torch
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--ckpt', required=True, help='输入 checkpoint')
-    p.add_argument('--out', required=True, help='输出（复活后的）checkpoint')
+    p.add_argument('--ckpt', required=True, help='input checkpoint')
+    p.add_argument('--out', required=True, help='output (revived) checkpoint')
     p.add_argument('--flow_std', type=float, default=0.05,
-                   help='outc_v 权重重新初始化的标准差。太小仍会学不动，太大初期预报会乱；'
-                        '建议 0.02~0.1，默认 0.05')
+                   help='std for re-initializing outc_v weights. Too small and it still cannot '
+                        'learn; too large and early forecasts get noisy. Suggested 0.02-0.1')
     p.add_argument('--reset_bias', action='store_true', default=True,
-                   help='同时把 bias 清零（默认开）。bias 是当前"常数流场"的来源')
+                   help='also zero the bias (default on) -- the bias is the source of the '
+                        'current constant flow field')
     p.add_argument('--also_reset_gamma', action='store_true',
-                   help='顺带把 gamma 重置为小正值（若强度项也疑似失效再用，默认不动）')
+                   help='also reset gamma to a small positive value (only if the intensity term also looks dead; off by default)')
     args = p.parse_args()
 
-    print(f"[INFO] 读取: {args.ckpt}", flush=True)
+    print(f"[INFO] Reading: {args.ckpt}", flush=True)
     ckpt = torch.load(args.ckpt, map_location='cpu', weights_only=False)
     if not isinstance(ckpt, dict) or 'model_state_dict' not in ckpt:
-        raise ValueError('checkpoint 里没有 model_state_dict，格式不对')
+        raise ValueError('no model_state_dict in checkpoint -- unexpected format')
     sd = ckpt['model_state_dict']
 
-    # 定位光流输出层（兼容 DDP 的 module. 前缀）
+    # Locate the flow output layer (tolerates the DDP 'module.' prefix)
     wk = [k for k in sd if k.endswith('outc_v.conv.weight')]
     bk = [k for k in sd if k.endswith('outc_v.conv.bias')]
     if not wk:
-        raise KeyError('没找到 outc_v.conv.weight，检查 checkpoint 是否为本模型')
+        raise KeyError('outc_v.conv.weight not found -- is this checkpoint from this model?')
     wk, bk = wk[0], (bk[0] if bk else None)
 
     w = sd[wk]
-    print(f"\n[复活前] {wk}")
+    print(f"\n[Before revival] {wk}")
     print(f"    shape={tuple(w.shape)} std={w.float().std():.6e} absmax={w.float().abs().max():.6e}")
     if bk is not None:
         b = sd[bk]
         print(f"    bias: mean={b.float().mean():.6f} absmax={b.float().abs().max():.6f}")
 
-    # ── 重新初始化：正态分布，std 由命令行给定 ──────────────────────────
+    # -- Re-initialize with a normal distribution; std given on the command line --
     new_w = torch.randn_like(w.float()) * args.flow_std
     sd[wk] = new_w.to(w.dtype)
     if bk is not None and args.reset_bias:
-        # bias 清零：它正是当前"恒定小位移"的来源，必须清掉
+        # Zero the bias: it is exactly the source of the current constant small displacement
         sd[bk] = torch.zeros_like(sd[bk])
 
-    print(f"\n[复活后] {wk}")
+    print(f"\n[After revival] {wk}")
     print(f"    std={sd[wk].float().std():.6e} absmax={sd[wk].float().abs().max():.6e}")
     if bk is not None and args.reset_bias:
-        print(f"    bias 已清零（原本是恒定流场的来源）")
+        print(f"    bias zeroed (it was the source of the constant flow field)")
 
     if args.also_reset_gamma:
         gk = [k for k in sd if k.endswith('evo_net.gamma')]
         if gk:
             sd[gk[0]] = torch.full_like(sd[gk[0]], 0.01)
-            print(f"    gamma 已重置为 0.01")
+            print(f"    gamma reset to 0.01")
 
-    # 优化器状态必须丢弃：旧的动量/二阶矩对应的是已死的权重，会立刻把新权重拉回零
+    # Optimizer state must be dropped: old momentum/second-moment terms belong to the dead
+    # weights and would immediately drag the new ones back to zero
     for k in ('optimizer_state_dict', 'scheduler_state_dict'):
         if k in ckpt:
             ckpt[k] = None
-    print("\n[INFO] 已清空 optimizer/scheduler 状态（旧动量会把新权重拽回零）")
+    print("\n[INFO] Cleared optimizer/scheduler state (old momentum would pull new weights back to zero)")
 
     ckpt['model_state_dict'] = sd
     ckpt['revived_flow'] = {'flow_std': args.flow_std, 'src': os.path.abspath(args.ckpt)}
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     torch.save(ckpt, args.out)
-    print(f"[DONE] 已保存: {args.out}")
-    print("\n下一步：用它 warm start 继续训练（判别器仍会自动继承）：")
+    print(f"[DONE] Saved: {args.out}")
+    print("\nNext: warm-start training from it (the discriminator is still inherited automatically):")
     print(f"    --pretrained_model {args.out}")
-    print("建议同时把学习率抬高一档（如 --lr 1e-4），让新初始化的光流层学得动。")
+    print("Also raise the learning rate a notch (e.g. --lr 1e-4) so the fresh flow layer can learn.")
 
 
 if __name__ == '__main__':

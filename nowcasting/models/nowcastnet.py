@@ -40,21 +40,22 @@ class Net(nn.Module):
         series = []
         last_frames = all_frames[:, (self.configs.input_length - 1):self.configs.input_length, :, :, 0]
         grid = self.grid.repeat(batch, 1, 1, 1)
-        # warp 插值模式（关键）：
-        #   原版 "nearest" 会把亚像素位移取整成 0 —— 而本模型预测的流场量级仅
-        #   ~0.02~0.2 像素/帧，于是 warp 实际什么都没做（等于原样复制上一帧），
-        #   台风只能靠 intensity 项反复叠加 → 结构被抹匀、1 小时糊掉；
-        #   更糟的是取整不可导，梯度传不回光流分支 → outc_v 权重坍缩(std 1e-4)
-        #   → 流场永远学不动。完整因果链：
-        #     nearest → 亚像素位移归零 → 光流对结果无影响 → 梯度≈0 → 权重坍缩
-        #   "bilinear" 支持亚像素位移且可导，是打破该死循环的前提。
+        # Warp interpolation mode (critical):
+        #   The original "nearest" rounds sub-pixel displacement to 0. Since the predicted
+        #   flow is only ~0.02-0.2 px/frame, warp effectively did nothing (it just copied
+        #   the previous frame), so a typhoon relied solely on the repeatedly accumulated
+        #   intensity term -- its structure got smeared out within an hour.
+        #   Worse, rounding is non-differentiable, so no gradient reached the flow branch
+        #   and outc_v weights collapsed (std 1e-4), leaving the flow unable to ever learn:
+        #     nearest -> sub-pixel motion zeroed -> flow has no effect -> grad ~= 0 -> collapse
+        #   "bilinear" is sub-pixel capable and differentiable, breaking that dead loop.
         warp_mode = getattr(self.configs, 'warp_mode', 'bilinear')
         for i in range(self.pred_length):
             last_frames = warp(last_frames, motion_[:, i], grid, mode=warp_mode, padding_mode="border")
             last_frames = last_frames + intensity_[:, i]
             series.append(last_frames)
         evo_result = torch.cat(series, dim=1)
-        # 数据在loader已归一化到[0,1]，此处无需额外缩放
+        # Data is already normalized to [0,1] in the loader; no extra scaling needed
 
         # Generative Network
         evo_feature = self.gen_enc(torch.cat([input_frames, evo_result], dim=1))
@@ -66,7 +67,7 @@ class Net(nn.Module):
         gen_result = self.gen_dec(feature, evo_result)
 
         if return_evo:
-            # evo_result: (B, pred_length, H, W) 归一化空间的纯平流+强度演变结果
-            # motion_   : (B, pred_length, 2, H, W) 光流场，用于平滑正则
+            # evo_result: (B, pred_length, H, W) pure advection + intensity evolution (normalized)
+            # motion_   : (B, pred_length, 2, H, W) optical-flow field, used for smoothness reg.
             return gen_result.unsqueeze(-1), evo_result, motion_
         return gen_result.unsqueeze(-1)
