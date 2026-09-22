@@ -13,7 +13,7 @@ adapted and trained for operational use over China (North China / South China).
 - **Adversarial training (GAN)**: spatiotemporal discriminator + pooling regularization, producing sharp fields with realistic convective cores instead of the over-smoothed output typical of L1 regression
 - **Frequency-balanced loss**: foreground and background are averaged separately, preventing the model collapse caused by radar fields being ~99% zero background
 - **Multi-region joint training**: North + South China data can be mixed into a single model
-- **Operational-ready**: single-level (composite reflectivity) and multi-level (12 height levels) pipelines, suitable for scheduled real-time runs
+- **Operational-ready**: single-level (composite reflectivity) and multi-level (24 height levels, 500–16000 m) pipelines, suitable for scheduled real-time runs
 
 ---
 
@@ -182,8 +182,14 @@ Planned direction: incorporate NWP wind fields to guide the Evolution network.
 
 ## Acknowledgements
 
-- Architecture based on [NowcastNet](https://github.com/thuml/NowcastNet) (Zhang et al., *Nature* 2023)
+- Architecture based on **NowcastNet** (Zhang et al., *Nature* 2023) —
+  [paper](https://www.nature.com/articles/s41586-023-06184-4).
+  The original implementation is released under the MIT License
+  (Copyright (c) 2022 Yuchen Zhang); that notice is retained in [LICENSE](LICENSE).
 
 ## License
 
-See [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
+
+This is a derivative work: the upstream NowcastNet copyright notice is retained alongside
+the copyright covering the modifications in this repository.
